@@ -83,6 +83,7 @@ SOURCES
     "src/module/xep/0380_explicit_encryption.vala"
     "src/module/xep/0391_jingle_encrypted_transports.vala"
     "src/module/xep/pixbuf_storage.vala"
+    "src/module/xep/reactions.vala"
 
     "src/util.vala"
 PACKAGES

@@ -79,6 +79,7 @@ public class ModuleManager {
             module_map[account].add(new StreamError.Module());
             module_map[account].add(new Xep.InBandRegistration.Module());
             module_map[account].add(new Xep.HttpFileUpload.Module());
+            module_map[account].add(new Xep.Reactions.Module());
             module_map[account].add(new Xep.Socks5Bytestreams.Module());
             module_map[account].add(new Xep.InBandBytestreams.Module());
             module_map[account].add(new Xep.Jingle.Module());

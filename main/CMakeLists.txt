@@ -16,6 +16,7 @@ set(RESOURCE_LIST
     icons/dino-changes-prevent-symbolic.svg
     icons/dino-conversation-list-placeholder-arrow.svg
     icons/dino-double-tick-symbolic.svg
+    icons/dino-emoticon-add-symbolic.svg
     icons/dino-emoticon-symbolic.svg
     icons/dino-qr-code-symbolic.svg
     icons/dino-party-popper-symbolic.svg
