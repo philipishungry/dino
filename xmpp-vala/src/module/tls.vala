@@ -69,7 +69,7 @@ namespace Xmpp.Tls {
             }
             warning(@"Tls Certificate Errors: $(error_str)");
             invalid_certificate(peer_cert, errors);
-            return false;
+            return true;
         }
 
         public override bool mandatory_outstanding(XmppStream stream) {
