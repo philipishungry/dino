@@ -1,7 +1,9 @@
 using Gee;
 
 using Xmpp;
+using Xmpp.Xep;
 using Dino.Entities;
+using Qlite;
 
 namespace Dino {
 
@@ -20,6 +22,11 @@ public class MessageProcessor : StreamInteractionModule, Object {
     private StreamInteractor stream_interactor;
     private Database db;
     private Object lock_send_unsent;
+    private HashMap<Account, int> current_catchup_id = new HashMap<Account, int>(Account.hash_func, Account.equals_func);
+    private HashMap<Account, HashMap<string, DateTime>> mam_times = new HashMap<Account, HashMap<string, DateTime>>();
+    public HashMap<string, int> hitted_range = new HashMap<string, int>();
+    public HashMap<Account, string> catchup_until_id = new HashMap<Account, string>(Account.hash_func, Account.equals_func);
+    public HashMap<Account, DateTime> catchup_until_time = new HashMap<Account, DateTime>(Account.hash_func, Account.equals_func);
 
     public static void start(StreamInteractor stream_interactor, Database db) {
         MessageProcessor m = new MessageProcessor(stream_interactor, db);
@@ -29,14 +36,35 @@ public class MessageProcessor : StreamInteractionModule, Object {
     private MessageProcessor(StreamInteractor stream_interactor, Database db) {
         this.stream_interactor = stream_interactor;
         this.db = db;
-        stream_interactor.account_added.connect(on_account_added);
-        stream_interactor.connection_manager.connection_state_changed.connect((account, state) => {
-            if (state == ConnectionManager.ConnectionState.CONNECTED) send_unsent_messages(account);
-        });
-        received_pipeline.connect(new DeduplicateMessageListener(db));
+
+        received_pipeline.connect(new DeduplicateMessageListener(this, db));
         received_pipeline.connect(new FilterMessageListener());
         received_pipeline.connect(new StoreMessageListener(stream_interactor));
         received_pipeline.connect(new MamMessageListener(stream_interactor));
+
+        stream_interactor.account_added.connect(on_account_added);
+
+        stream_interactor.connection_manager.connection_state_changed.connect((account, state) => {
+            if (state == ConnectionManager.ConnectionState.CONNECTED) send_unsent_messages(account);
+        });
+
+        stream_interactor.connection_manager.stream_opened.connect((account, stream) => {
+            print(@"setting catchup_id to -1 $(account.bare_jid)\n");
+            current_catchup_id.unset(account);
+            mam_times[account] = new HashMap<string, DateTime>();
+
+            stream.received_message_stanza.connect((stream, node) => {
+                // TODO check for server addr
+
+
+//            foreach (Row a in db.mam_catchup.select().with(db.mam_catchup.account_id, "=", account.id)) {
+//                if (a[db.mam_catchup.id] > 0 && a[db.mam_catchup.to_id] == stanza_id) {
+//                    hitted_range[account] = a[db.mam_catchup.id];
+//                    print(@"hitted range right side $(hitted_range[account])\n");
+//                }
+//            }
+            });
+        });
     }
 
     public Entities.Message send_text(string text, Conversation conversation) {
@@ -65,22 +93,259 @@ public class MessageProcessor : StreamInteractionModule, Object {
         stream_interactor.module_manager.get_module(account, Xmpp.MessageModule.IDENTITY).received_message.connect( (stream, message) => {
             on_message_received.begin(account, message);
         });
+        XmppStream? stream_bak = null;
         stream_interactor.module_manager.get_module(account, Xmpp.Xep.MessageArchiveManagement.Module.IDENTITY).feature_available.connect( (stream) => {
-            DateTime start_time = account.mam_earliest_synced.to_unix() > 60 ? account.mam_earliest_synced.add_minutes(-1) : account.mam_earliest_synced;
-            stream.get_module(Xep.MessageArchiveManagement.Module.IDENTITY).query_archive(stream, null, start_time, null, () => {
-                history_synced(account);
-            });
+            if (stream == stream_bak) return;
+
+            current_catchup_id.unset(account);
+            stream_bak = stream;
+            print(@"feature available current_catchup_id $(current_catchup_id[account])\n");
+            do_mam_catchup.begin(account);
         });
+
+        stream_interactor.module_manager.get_module(account, Xmpp.MessageModule.IDENTITY).received_message_unprocessed.connect((stream, message) => {
+            if (!message.from.equals(account.bare_jid)) return;
+//            print(message.stanza.to_string() + "\n");
+//            print(account.bare_jid.to_string() + "\n");
+
+//            foreach (Row a in db.mam_catchup.select().with(db.mam_catchup.account_id, "=", account.id)) {
+//                if (a[db.mam_catchup.id] > 0 && a[db.mam_catchup.to_id] == stanza_id) {
+//                    hitted_range[account] = a[db.mam_catchup.id];
+//                    print(@"hitted range right side $(hitted_range[account])\n");
+//                }
+//            }
+
+            Xep.MessageArchiveManagement.Flag? mam_flag = stream != null ? stream.get_flag(Xep.MessageArchiveManagement.Flag.IDENTITY) : null;
+            if (mam_flag == null) return;
+            string? id = message.stanza.get_deep_attribute(mam_flag.ns_ver + ":result", "id");
+            if (id == null) return;
+            StanzaNode? delay_node = message.stanza.get_deep_subnode(mam_flag.ns_ver + ":result", "urn:xmpp:forward:0:forwarded", "urn:xmpp:delay:delay");
+            if (delay_node == null) return;
+            DateTime? time = DelayedDelivery.Module.get_time_for_node(delay_node);
+            if (time == null) return;
+            mam_times[account][id] = time;
+        });
+    }
+
+    private async void do_mam_catchup(Account account) {
+        print("do mam catchup\n");
+        string? earliest_id = null;
+        DateTime? earliest_time = null;
+        bool continue_sync = true;
+
+        while (continue_sync) {
+            continue_sync = false;
+
+            // Get previous row
+            var previous_qry = db.mam_catchup.select().with(db.mam_catchup.account_id, "=", account.id).order_by(db.mam_catchup.to_time, "DESC");
+            if (current_catchup_id.has_key(account)) {
+                previous_qry.with(db.mam_catchup.id, "!=", current_catchup_id[account]);
+                print("do_mam_catchup a\n");
+            }
+            RowOption previous_row = previous_qry.single().row();
+            if (previous_row.is_present()) {
+                catchup_until_id[account] = previous_row[db.mam_catchup.to_id];
+                catchup_until_time[account] = (new DateTime.from_unix_utc(previous_row[db.mam_catchup.from_time])).add_minutes(-5);
+                print("do_mam_catchup b\n");
+            } else {
+                catchup_until_id.unset(account);
+                catchup_until_time.unset(account);
+                print("do_mam_catchup c\n");
+            }
+
+            string query_id = Xmpp.random_uuid();
+            yield get_mam_range(account, query_id, null, null, earliest_time, earliest_id);
+
+            if (!hitted_range.has_key(query_id)) {
+                print("set end\n");
+                db.mam_catchup.update()
+                    .set(db.mam_catchup.from_end, true)
+                    .with(db.mam_catchup.id, "=", current_catchup_id[account])
+                    .perform();
+            }
+
+            if (hitted_range.has_key(query_id)) {
+                if (merge_ranges(account, null)) {
+                    RowOption current_row = db.mam_catchup.row_with(db.mam_catchup.id, current_catchup_id[account]);
+                    bool range_from_complete = current_row[db.mam_catchup.from_end];
+                    if (!range_from_complete) {
+                        continue_sync = true;
+                        earliest_id = current_row[db.mam_catchup.from_id];
+                        earliest_time = (new DateTime.from_unix_utc(current_row[db.mam_catchup.from_time])).add_seconds(1);
+                    }
+                }
+            }
+        }
+    }
+
+    /*
+     * Merges the row with `current_catchup_id` with the previous range (optional: with `earlier_id`)
+     * Changes `current_catchup_id` to the previous range
+     */
+    private bool merge_ranges(Account account, int? earlier_id) {
+        print("merge ranges!\n");
+        RowOption current_row = db.mam_catchup.row_with(db.mam_catchup.id, current_catchup_id[account]);
+        RowOption previous_row = null;
+
+        if (earlier_id != null) {
+            previous_row = db.mam_catchup.row_with(db.mam_catchup.id, earlier_id);
+        } else {
+            previous_row = db.mam_catchup.select()
+                .with(db.mam_catchup.account_id, "=", account.id)
+                .with(db.mam_catchup.id, "!=", current_catchup_id[account])
+                .order_by(db.mam_catchup.to_time, "DESC").single().row();
+        }
+
+        if (!previous_row.is_present()) {
+            print("no prev row\n");
+            return false;
+        }
+
+        var qry = db.mam_catchup.update().with(db.mam_catchup.id, "=", previous_row[db.mam_catchup.id]);
+        print(@"merging $(previous_row[db.mam_catchup.from_time])-$(previous_row[db.mam_catchup.to_time]) with $(current_row[db.mam_catchup.from_time])-$(current_row[db.mam_catchup.to_time])\n");
+        if (current_row[db.mam_catchup.from_time] < previous_row[db.mam_catchup.from_time]) {
+            qry.set(db.mam_catchup.from_id, current_row[db.mam_catchup.from_id])
+                    .set(db.mam_catchup.from_time, current_row[db.mam_catchup.from_time]);
+        }
+        if (current_row[db.mam_catchup.to_time] > previous_row[db.mam_catchup.to_time]) {
+            qry.set(db.mam_catchup.to_id, current_row[db.mam_catchup.to_id])
+                .set(db.mam_catchup.to_time, current_row[db.mam_catchup.to_time]);
+        }
+        qry.perform();
+
+        current_catchup_id[account] = previous_row[db.mam_catchup.id];
+
+        db.mam_catchup.delete().with(db.mam_catchup.id, "=", current_row[db.mam_catchup.id]).perform();
+
+        return true;
+    }
+
+    private async bool get_mam_range(Account account, string? query_id, DateTime? from_time, string? from_id, DateTime? to_time, string? to_id) {
+        print(@"get_mam_range\n");
+        if (from_time != null) print(@"$(from_time)\n");
+        if (to_time != null) print(@"$(to_time)\n");
+        XmppStream stream = stream_interactor.get_stream(account);
+
+        Iq.Stanza? iq = yield stream.get_module(Xep.MessageArchiveManagement.Module.IDENTITY).query_archive(stream, null, query_id, from_time, from_id, to_time, to_id);
+
+        if (iq == null) {
+            print("return false\n");
+            return true;
+        }
+
+        if (iq.stanza.get_deep_string_content("urn:xmpp:mam:2:fin", "http://jabber.org/protocol/rsm" + ":set", "first") == null) {
+            return true;
+        }
+
+        while (iq != null) {
+            print(@"IN: $(iq.stanza)\n");
+            string? earliest_id = iq.stanza.get_deep_string_content("urn:xmpp:mam:2:fin", "http://jabber.org/protocol/rsm" + ":set", "first");
+            if (earliest_id == null) return true;
+
+            if (!mam_times[account].has_key(earliest_id)) error("wtf");
+
+            if (earliest_id != null) print(@"update from_id $(earliest_id)\n");
+            if (!current_catchup_id.has_key(account)) {
+                print(@"We get our first MAM page\n");
+                string? latest_id = iq.stanza.get_deep_string_content("urn:xmpp:mam:2:fin", "http://jabber.org/protocol/rsm" + ":set", "last");
+                if (!mam_times[account].has_key(latest_id)) error("wtf2");
+                current_catchup_id[account] = (int) db.mam_catchup.insert()
+                        .value(db.mam_catchup.account_id, account.id)
+                        .value(db.mam_catchup.from_id, earliest_id)
+                        .value(db.mam_catchup.from_time, (long)mam_times[account][earliest_id].to_unix())
+                        .value(db.mam_catchup.to_id, latest_id)
+                        .value(db.mam_catchup.to_time, (long)mam_times[account][latest_id].to_unix())
+                        .perform();
+            } else {
+                // Update existing id
+                db.mam_catchup.update()
+                        .set(db.mam_catchup.from_id, earliest_id)
+                        .set(db.mam_catchup.from_time, (long)mam_times[account][earliest_id].to_unix()) // need to make sure we have this
+                        .with(db.mam_catchup.id, "=", current_catchup_id[account])
+                        .perform();
+            }
+
+            TimeSpan catchup_time_ago = (new DateTime.now_utc()).difference(mam_times[account][earliest_id]);
+            print(@"timespan $catchup_time_ago\n");
+            int wait_ms = 10;
+            if (catchup_time_ago > 14 * TimeSpan.DAY) {
+                print("1\n");
+                wait_ms = 2000;
+            } else if (catchup_time_ago > 5 * TimeSpan.DAY) {
+                print("2\n");
+                wait_ms = 1000;
+            } else if (catchup_time_ago > 2 * TimeSpan.DAY) {
+                print("3\n");
+                wait_ms = 200;
+            } else if (catchup_time_ago > TimeSpan.DAY) {
+                print("4\n");
+                wait_ms = 50;
+            }
+
+            mam_times[account] = new HashMap<string, DateTime>();
+
+            Timeout.add(wait_ms, () => {
+                if (hitted_range.has_key(query_id)) {
+                    print(@"hitted contains key $(query_id)\n");
+                    iq = null;
+                    Idle.add(get_mam_range.callback);
+                    return false;
+                }
+
+                stream.get_module(Xep.MessageArchiveManagement.Module.IDENTITY).page_through_results.begin(stream, null, query_id, from_time, to_time, iq, (_, res) => {
+                    iq = stream.get_module(Xep.MessageArchiveManagement.Module.IDENTITY).page_through_results.end(res);
+                    Idle.add(get_mam_range.callback);
+                });
+                return false;
+            });
+            yield;
+        }
+        return false;
     }
 
     private async void on_message_received(Account account, Xmpp.MessageStanza message_stanza) {
         Entities.Message message = yield parse_message_stanza(account, message_stanza);
 
         Conversation? conversation = stream_interactor.get_module(ConversationManager.IDENTITY).get_conversation_for_message(message);
-        if (conversation != null) {
-            bool abort = yield received_pipeline.run(message, message_stanza, conversation);
-            if (abort) return;
+        if (conversation == null) return;
+
+        // MAM state database update
+        Xep.MessageArchiveManagement.MessageFlag mam_flag = Xep.MessageArchiveManagement.MessageFlag.get_flag(message_stanza);
+        if (mam_flag == null) {
+            if (current_catchup_id.has_key(account)) {
+                string? stanza_id = UniqueStableStanzaIDs.get_stanza_id(message_stanza, account.bare_jid);
+                if (stanza_id != null) {
+                    db.mam_catchup.update()
+                        .with(db.mam_catchup.id, "=", current_catchup_id[account])
+                        .set(db.mam_catchup.to_time, (long)message.local_time.to_unix())
+                        .set(db.mam_catchup.to_id, stanza_id)
+                        .perform();
+                }
+            }
+        } else {
+            if (current_catchup_id.has_key(account)) {
+                print("on msg: updated with key\n");
+                // TODO maybe check if the db entry is already earlier
+                db.mam_catchup.update()
+                        .with(db.mam_catchup.id, "=", current_catchup_id[account])
+                        .set(db.mam_catchup.from_time, (long)mam_flag.server_time.to_unix())
+                        .set(db.mam_catchup.from_id, mam_flag.mam_id)
+                        .perform();
+            } else {
+                print("on msg: inserted row\n");
+                current_catchup_id[account] = (int)db.mam_catchup.insert()
+                    .value(db.mam_catchup.account_id, account.id)
+                    .value(db.mam_catchup.from_time, (long)mam_flag.server_time.to_unix())
+                    .value(db.mam_catchup.from_id, mam_flag.mam_id)
+                    .value(db.mam_catchup.to_time, (long)mam_flag.server_time.to_unix())
+                    .value(db.mam_catchup.to_id, mam_flag.mam_id)
+                    .perform();
+            }
         }
+
+        bool abort = yield received_pipeline.run(message, message_stanza, conversation);
+        if (abort) return;
+
         if (message.direction == Entities.Message.DIRECTION_RECEIVED) {
             message_received(message, conversation);
         } else if (message.direction == Entities.Message.DIRECTION_SENT) {
@@ -170,24 +435,81 @@ public class MessageProcessor : StreamInteractionModule, Object {
         public override string action_group { get { return "DEDUPLICATE"; } }
         public override string[] after_actions { get { return after_actions_const; } }
 
+        private MessageProcessor outer;
         private Database db;
 
-        public DeduplicateMessageListener(Database db) {
+        public DeduplicateMessageListener(MessageProcessor outer, Database db) {
+            this.outer = outer;
             this.db = db;
         }
 
         public override async bool run(Entities.Message message, Xmpp.MessageStanza stanza, Conversation conversation) {
+            Account account = conversation.account;
+
+            Xep.MessageArchiveManagement.MessageFlag? mam_flag = Xep.MessageArchiveManagement.MessageFlag.get_flag(stanza);
+
+            // Deduplicate by server_id
             if (message.server_id != null) {
-                return db.contains_message_by_server_id(conversation.account, message.counterpart, message.server_id);
-            } else if (message.stanza_id != null) {
-                bool is_uuid = Regex.match_simple("""[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}""", message.stanza_id);
-                if (is_uuid) {
-                    return db.contains_message_by_stanza_id(message, conversation.account);
-                } else {
-                    return db.contains_message(message, conversation.account);
+                QueryBuilder builder =  db.message.select()
+                        .with(db.message.server_id, "=", message.server_id)
+                        .with(db.message.counterpart_id, "=", db.get_jid_id(message.counterpart))
+                        .with(db.message.account_id, "=", account.id);
+                bool duplicate = builder.count() > 0;
+
+                if (duplicate && mam_flag != null) {
+                    print(@"hitted range duplicate server id  $(mam_flag.query_id) \n");
+                    if (message.server_id == outer.catchup_until_id[account]) {
+                        print("in range (id)\n");
+                        outer.hitted_range[mam_flag.query_id] = -2;
+                    } else if (outer.catchup_until_time.has_key(account) && mam_flag.server_time.compare(outer.catchup_until_time[account]) > 0) {
+                        outer.hitted_range[mam_flag.query_id] = -1;
+                        print("in range (time)\n");
+                    }
                 }
+                if (duplicate) return true;
             }
-            return false;
+
+            // Deduplicate messages by uuid
+            bool is_uuid = message.stanza_id != null && Regex.match_simple("""[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}""", message.stanza_id);
+            if (is_uuid) {
+                QueryBuilder builder =  db.message.select()
+                        .with(db.message.stanza_id, "=", message.stanza_id)
+                        .with(db.message.counterpart_id, "=", db.get_jid_id(message.counterpart))
+                        .with(db.message.account_id, "=", account.id);
+                if (message.counterpart.resourcepart != null) {
+                    builder.with(db.message.counterpart_resource, "=", message.counterpart.resourcepart);
+                } else {
+                    builder.with_null(db.message.counterpart_resource);
+                }
+                RowOption row_opt = builder.single().row();
+                bool duplicate = row_opt.is_present();
+
+                if (duplicate && mam_flag != null && row_opt[db.message.server_id] == null &&
+                        outer.catchup_until_time.has_key(account) && mam_flag.server_time.compare(outer.catchup_until_time[account]) > 0) { // TODO also check time
+                    outer.hitted_range[mam_flag.query_id] = -1;
+                    print(@"hitted range duplicate message id $(mam_flag.query_id)\n");
+                }
+                return duplicate;
+            }
+
+            // Deduplicate messages based on content and metadata
+            QueryBuilder builder = db.message.select()
+                    .with(db.message.account_id, "=", account.id)
+                    .with(db.message.counterpart_id, "=", db.get_jid_id(message.counterpart))
+                    .with(db.message.body, "=", message.body)
+                    .with(db.message.time, "<", (long) message.time.add_minutes(1).to_unix())
+                    .with(db.message.time, ">", (long) message.time.add_minutes(-1).to_unix());
+            if (message.stanza_id != null) {
+                builder.with(db.message.stanza_id, "=", message.stanza_id);
+            } else {
+                builder.with_null(db.message.stanza_id);
+            }
+            if (message.counterpart.resourcepart != null) {
+                builder.with(db.message.counterpart_resource, "=", message.counterpart.resourcepart);
+            } else {
+                builder.with_null(db.message.counterpart_resource);
+            }
+            return builder.count() > 0;
         }
     }
 
