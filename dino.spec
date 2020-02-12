@@ -45,10 +45,6 @@ Development files for dino.
 %prep
 %setup -q -n %{name}-%{version}
 
-# Remove the bundled library
-rm .gitmodules
-rm -r plugins/signal-protocol/libsignal-protocol-c
-
 
 %build
 # Use the system version of libsignal-protocol-c instead of the bundled one.
