@@ -4,20 +4,8 @@ Release:    1%{?dist}
 
 License:    GPLv3
 Summary:    Modern XMPP ("Jabber") Chat Client using GTK+/Vala
-URL:        https://github.com/dino/dino
-Source0:    %{url}/releases/download/v%{version}/dino-%{version}.tar.gz
-Source1:    %{url}/releases/download/v%{version}/dino-%{version}.tar.gz.asc
-# dino.im has a published Web Key Directory[0], which is the URL used here. However, I also verified
-# that the key matched what was available via public key servers. I also verified that the key was
-# indeed the key that generated the signature for the release tarball for dino-0.1.0, ensuring that
-# both the signature and tarball were retrieved from GitHub over TLS. Lastly, a couple users
-# in the official Dino MUC chat room, chat@dino.im, verified the full release key ID, and my
-# connection to that chat room used CA verified TLS. I believe the WKD verification is strong
-# enough, but I feel more confident given my secondary (though admittedly weaker)
-# verifications.
-#
-# [0] https://wiki.gnupg.org/WKD
-Source2:    https://dino.im/.well-known/openpgpkey/hu/kf5ictsogs7pr4rbewa9ie1he85r9ghc
+URL:        https://github.com/philipishungry/dino
+Source0:    %{url}/archive/308db53bc5a8fa44f66c0a8668384d3e5b592ce7.tar.gz
 
 BuildRequires: cmake
 BuildRequires: desktop-file-utils
@@ -55,7 +43,6 @@ Development files for dino.
 
 
 %prep
-%{gpgverify} --keyring='%{SOURCE2}' --signature='%{SOURCE1}' --data='%{SOURCE0}'
 %setup -q -n %{name}-%{version}
 
 # Remove the bundled library
