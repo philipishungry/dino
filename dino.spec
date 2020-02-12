@@ -5,7 +5,7 @@ Release:    1%{?dist}
 License:    GPLv3
 Summary:    Modern XMPP ("Jabber") Chat Client using GTK+/Vala
 URL:        https://github.com/philipishungry/dino
-Source0:    %{url}/archive/308db53bc5a8fa44f66c0a8668384d3e5b592ce7.tar.gz
+Source0:    %{url}/archive/f9b5043958d84a917a38bf40058a9aaa53368777.tar.gz
 
 BuildRequires: cmake
 BuildRequires: desktop-file-utils
